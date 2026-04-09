@@ -303,8 +303,11 @@ def megabatch_orthogonalize_async(
         ]
 
         output_chunks = [torch.empty_like(c) for c in input_chunks]
-        torch.cuda.synchronize()
-        pre_err = torch.cuda.last_error()
+        try:
+            torch.cuda.synchronize()
+            pre_err = "none"
+        except RuntimeError as e:
+            pre_err = str(e)
         if device_rank == 0:
             print(f"[megabatch_diag] sharded path: N={N} per_rank={per_rank} "
                   f"shape={U[0].shape} comm_dim={comm_dim} "
