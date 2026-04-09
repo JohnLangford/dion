@@ -159,6 +159,10 @@ class NorMuon(DistributedOrthoBase):
                 sharding = p.placements if isinstance(p, DTensor) else None
                 shape_groups[(p.shape, sharding, p.dtype)].append(p)
 
+            if self._device_rank == 0:
+                for (_s, _sh, _d), _ps in shape_groups.items():
+                    print(f"[megabatch_diag] shape_group: shape={_s} N={len(_ps)} sharding={_sh} dtype={_d}", flush=True)
+
             for (_shape, _sharding, _dtype), params in shape_groups.items():
                 gradients = [p.grad for p in params]
                 states = [self._get_or_initialize_state(p, self._algo_name) for p in params]
