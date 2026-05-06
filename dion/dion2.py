@@ -385,21 +385,12 @@ def dion2_post_orthogonalize(
     """
     torch._foreach_mul_(X, 1 - base_lr * weight_decay)
 
-    # # Convert U to match parameter dtype
-    # dtype = X[0].dtype
-    # U = [u.to(dtype=dtype) for u in U]
-    # Apply weight update
-    # neg_lr = -adjusted_lr
-    # U_scaled = [neg_lr * u for u in U]
-    # Convert U to match parameter dtype
-    # dtype = X[0].dtype
-    # U_scaled = [u.to(dtype=dtype) for u in U_scaled]
-
-    U_scaled = torch._foreach_mul(U, -adjusted_lr)
-
-    # Convert U to match parameter dtype
+    # Convert U to parameter dtype BEFORE scaling so the multiply happens in
+    # fp32, not bf16. Doing this after computing U_scaled (as before) leaves
+    # U_scaled in bf16 and silently loses precision in the lr*U product.
     dtype = X[0].dtype
     U = [u.to(dtype=dtype) for u in U]
+    U_scaled = torch._foreach_mul(U, -adjusted_lr)
 
     # this  makes dion2 and muon bitwise identical
     if muon_mode:
