@@ -395,11 +395,13 @@ def dion2_post_orthogonalize(
     # dtype = X[0].dtype
     # U_scaled = [u.to(dtype=dtype) for u in U_scaled]
 
-    U_scaled = torch._foreach_mul(U, -adjusted_lr)
-
-    # Convert U to match parameter dtype
+    # Cast U to fp32 BEFORE the multiply so U_scaled is fp32 in BOTH
+    # branches. Removes the bf16-multiply confound from the muon_mode=False
+    # path (the original code left U_scaled in bf16; Inductor still upcast
+    # inside the kernel, but this makes the dtype path explicit).
     dtype = X[0].dtype
     U = [u.to(dtype=dtype) for u in U]
+    U_scaled = torch._foreach_mul(U, -adjusted_lr)
 
     # this  makes dion2 and muon bitwise identical
     if muon_mode:
