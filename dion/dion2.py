@@ -405,7 +405,13 @@ def dion2_post_orthogonalize(
 
     # this  makes dion2 and muon bitwise identical
     if muon_mode:
-        torch._foreach_add_(X, U_scaled)
+        # DEBUG: per-tensor python loop instead of _foreach_add_ to break
+        # Inductor's multi-tensor fusion of weight-decay + U_scaled + add
+        # into one kernel. If this matches eager mm=true, the fused
+        # foreach kernel (likely lowered to FMA) is the source of the
+        # compiled-mm=true trajectory divergence.
+        for x, u_scaled in zip(X, U_scaled):
+            x.add_(u_scaled)
     else:
         # Apply the orthogonalized update to only the selected rows/columns.
         dim = X[0].ndim + select_dim if select_dim < 0 else select_dim
