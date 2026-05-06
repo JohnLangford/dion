@@ -367,7 +367,11 @@ def dion2_pre_orthogonalize(
 # NOTE: if this function starts failing with an InductorError on recompilation
 # across tensor ranks, apply the same _inductor_workaround used on
 # dion2_pre_orthogonalize above.  See pytorch/pytorch#176591.
-@torch.compile(fullgraph=True)
+# DEBUG: @torch.compile is deliberately disabled on this branch to test whether
+# Inductor's lowering of the muon_mode True/False branches is the source of
+# the trajectory divergence at fraction=1.0. The fp32-cast-before-mul change
+# is preserved so eager index_add_ does not fail on bf16+fp32 dtype mismatch.
+@torch._dynamo.disable
 def dion2_post_orthogonalize(
     X: List[Tensor],
     U: List[Tensor],
