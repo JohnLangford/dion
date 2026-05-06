@@ -1,4 +1,5 @@
 import math
+import os
 import torch
 from collections import defaultdict
 from torch import Tensor
@@ -8,6 +9,12 @@ from torch.optim.optimizer import ParamsT
 from typing import Callable, Generator, List, Optional, Tuple, Union
 
 from dion.muon import muon_update_post_orthogonalize, muon_update_pre_orthogonalize
+
+# Debug probe: when DION2_PROBE=1, after each muon_mode=False post-orth, recompute
+# what the muon_mode=True branch would produce and log max|delta| per param group.
+# Single-step measurement of post-orthogonalize divergence between the two paths.
+_DION2_PROBE = os.environ.get("DION2_PROBE", "0") == "1"
+_DION2_PROBE_CALLS = 0
 
 from .megabatch_base import (
     DistributedOrthoBase,
@@ -263,6 +270,12 @@ def dion2_update_megabatch_async(
         raise ValueError(f"Unknown adjust_lr: {adjust_lr}")
 
     # Post-orthogonalize: apply update to selected indices only
+    if _DION2_PROBE and not muon_mode:
+        # Snapshot X (fp32 params) BEFORE the false-branch update so we can
+        # recompute what the muon_mode=True branch would have produced and
+        # compare. The compiled false branch modifies X in place.
+        X_local_pre_post = [x.clone() for x in to_local(X)]
+
     dion2_post_orthogonalize(
         X=to_local(X),
         U=U_ortho,
@@ -273,6 +286,38 @@ def dion2_update_megabatch_async(
         select_dim=select_dim,
         muon_mode=muon_mode,
     )
+
+    if _DION2_PROBE and not muon_mode:
+        # Reproduce what muon_mode=True branch would produce, in plain eager
+        # python ops, then diff against the actual (false-branch) X.
+        X_local_post = to_local(X)
+        dtype_p = X_local_pre_post[0].dtype
+        X_true = [x * (1 - lr * weight_decay) for x in X_local_pre_post]
+        for xt, u in zip(X_true, U_ortho):
+            u_cast = u.to(dtype=dtype_p)
+            xt.add_(u_cast, alpha=float(-adjusted_lr))
+        diffs_max = [
+            (x - xt).abs().max().item() for x, xt in zip(X_local_post, X_true)
+        ]
+        diffs_l2 = [
+            (x - xt).norm().item() for x, xt in zip(X_local_post, X_true)
+        ]
+        x_norms = [x.norm().item() for x in X_local_post]
+        n = len(diffs_max)
+        global _DION2_PROBE_CALLS
+        _DION2_PROBE_CALLS += 1
+        # Print every call; downstream filtering can subsample.
+        # Tag with shape so we can group by param family.
+        print(
+            f"[DION2_PROBE] call={_DION2_PROBE_CALLS} "
+            f"shape={tuple(X_local_post[0].shape)} n={n} "
+            f"select_dim={select_dim} adj_lr={float(adjusted_lr):.4e} "
+            f"max|delta|={max(diffs_max):.3e} "
+            f"mean|delta|={sum(diffs_max)/n:.3e} "
+            f"max_l2_delta={max(diffs_l2):.3e} "
+            f"mean_x_norm={sum(x_norms)/n:.3e}",
+            flush=True,
+        )
 
 
 # Workaround for a torch.compile bug in PyTorch ≤2.11's inductor backend:
