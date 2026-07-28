@@ -33,11 +33,13 @@ Usage:
 """
 
 import argparse
+import dataclasses
 import json
 import os
 import time
 import torch
 import torch.distributed as dist
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -277,10 +279,16 @@ def main():
             t_prev = t_now
 
     if is_main and active_metrics:
-        out_path = Path(output_dir) / "active_step_metrics.json"
+        # Self-describing artifact: the exact resolved config (hp fields + all CLI
+        # flags/overrides) travels with the timings, so nothing depends on the
+        # output folder name to know what produced these numbers.
+        config = {**dataclasses.asdict(hp), **vars(cli_args), "num_params": num_params}
+        payload = {"config": config, "steps": active_metrics}
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")  # compact date+time to seconds
+        out_path = Path(output_dir) / f"active_step_metrics_{ts}.json"
         with open(out_path, "w") as f:
-            json.dump(active_metrics, f, indent=2)
-        print0(f"Wrote {len(active_metrics)} active-step metrics to {out_path}")
+            json.dump(payload, f, indent=2)
+        print0(f"Wrote {len(active_metrics)} active-step metrics (+config) to {out_path}")
 
     if dist.is_initialized():
         dist.destroy_process_group()
