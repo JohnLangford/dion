@@ -32,14 +32,33 @@ SIZES=(
     "14b|--model_dim 5120 --n_layer 40 --n_head 40 --device_batch_size 4 --batch_size 4"
 )
 
-# Variants (ordered). Each entry: "name|<flags>" (empty flags allowed).
+# Args:
+#   $1 = size name, or "all" / omitted for every size (e.g. `./run_variants.sh 7b`)
+#   $2 = optimizer family: "muon-family" (default) or "normuon-family"
+SIZE_ARG="${1:-all}"
+FAMILY="${2:-muon-family}"
+
+# The family picks the two optimizers substituted into the variants below:
+#   UNFILTERED = full-orthogonalization optimizer (variants 3-6)
+#   FILTERED   = low-rank / fractional optimizer   (variants 7-8)
+case "$FAMILY" in
+    muon-family)    UNFILTERED=muon;    FILTERED=dion2 ;;
+    normuon-family) UNFILTERED=normuon; FILTERED=nordion2 ;;
+    *) echo "Unknown family '$FAMILY'. Valid: muon-family, normuon-family" >&2; exit 1 ;;
+esac
+
+# Variants (ordered). Each entry: "name|<flags>". The optimizer is substituted
+# from the selected family via $UNFILTERED / $FILTERED, expanded here at
+# definition time -- no post-hoc string rewriting.
 VARIANTS=(
-    # "1-plain|--no_triton"
-    # "2-triton|"
-    "3-baseline|--use_gns_package --no_triton"
-    "4-cutlass|--use_gns_package"
-    "5-gns|--use_gns_package --no_triton --use_gns_alg"
-    "6-gns-cutlass|--use_gns_package --use_gns_alg"
+    # "1-plain|--optimizer $UNFILTERED --no_triton"
+    # "2-triton|--optimizer $UNFILTERED"
+    "3-baseline|--optimizer $UNFILTERED --use_gns_package --no_triton"
+    "4-cutlass|--optimizer $UNFILTERED --use_gns_package"
+    "5-gns|--optimizer $UNFILTERED --use_gns_package --no_triton --use_gns_alg"
+    "6-gns-cutlass|--optimizer $UNFILTERED --use_gns_package --use_gns_alg"
+    "7-dion2-0.5|--optimizer $FILTERED --use_gns_package --use_gns_alg --ortho_fraction 0.5"
+    "8-dion2-0.25|--optimizer $FILTERED --use_gns_package --use_gns_alg --ortho_fraction 0.25"
 )
 
 run() {
@@ -52,20 +71,19 @@ run() {
         "$@"
 }
 
-# Optional first argument: run only the named size (e.g. `./run_variants.sh 7b`).
-# With no argument, run all sizes.
-if [[ $# -ge 1 ]]; then
-    want="$1"
+if [[ "$SIZE_ARG" != "all" ]]; then
     selected=()
     for s in "${SIZES[@]}"; do
-        [[ "${s%%|*}" == "$want" ]] && selected+=("$s")
+        [[ "${s%%|*}" == "$SIZE_ARG" ]] && selected+=("$s")
     done
     if [[ ${#selected[@]} -eq 0 ]]; then
-        echo "Unknown size '$want'. Valid sizes: ${SIZES[*]%%|*}" >&2
+        echo "Unknown size '$SIZE_ARG'. Valid sizes: ${SIZES[*]%%|*}" >&2
         exit 1
     fi
     SIZES=("${selected[@]}")
 fi
+
+echo "Optimizer family: $FAMILY  (unfiltered=$UNFILTERED, filtered=$FILTERED)"
 
 for s in "${SIZES[@]}"; do
     sname="${s%%|*}"; sflags="${s#*|}"
@@ -78,4 +96,4 @@ for s in "${SIZES[@]}"; do
     done
 done
 
-echo "Done. Metrics in results/<size>/<variant>/active_step_metrics.json"
+echo "Done. Metrics in results/<size>/<variant>/active_step_metrics_<ts>.json"
