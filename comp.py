@@ -1,68 +1,89 @@
+import re
+from pathlib import Path
+
 import pandas as pd
-
-files = [
-    "results/1-plain/active_step_metrics.json",
-    "results/2-triton/active_step_metrics.json",
-    "results/3-baseline/active_step_metrics.json",
-    "results/4-cutlass/active_step_metrics.json",
-    "results/5-gns/active_step_metrics.json",
-    "results/6-gns-cutlass/active_step_metrics.json",
-]
-
-df = pd.concat(
-    [pd.read_json(f).assign(file=f.split("/")[1]) for f in files],
-    ignore_index=True,
-)
-
-# Preserve the condition order from `files`, not alphabetical.
-order = [f.split("/")[1] for f in files]
-
-avg = df.groupby("file").median(numeric_only=True).reindex(order)
-print(avg)
-avg.to_csv("results/avg.csv", index=True)
-
-# Each column normalized by its value in the first row (the baseline condition).
-rel = avg / avg.iloc[0]
-print(rel)
-rel.to_csv("results/avg_relative.csv", index=True)
-
-
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import seaborn as sns
+
+RESULTS = Path("results")
+
+# Recursively load every per-run metrics JSON. Layout is
+# results/<size>/<condition>/active_step_metrics.json, so the first dir level is
+# the model size and the second is the condition -- both become columns.
+frames = []
+for p in sorted(RESULTS.rglob("*.json")):
+    rel = p.relative_to(RESULTS)
+    if len(rel.parts) != 3:  # expect exactly size/condition/<file>.json
+        continue
+    size, condition = rel.parts[0], rel.parts[1]
+    frames.append(pd.read_json(p).assign(size=size, condition=condition))
+
+if not frames:
+    raise SystemExit("No metrics JSONs found under results/<size>/<condition>/")
+
+df = pd.concat(frames, ignore_index=True)
 
 metrics = ["gpu_opt_ms", "cpu_opt_ms", "dt_ms"]
-metrics = ["gpu_opt_ms", "cpu_opt_ms", "dt_ms"]
 
-fig, axes = plt.subplots(len(metrics), 1, figsize=(10, 11), sharex=True)
-positions = range(1, len(order) + 1)
+# Ordering: sizes by their leading number (1b, 3b, ... 14b), conditions sorted.
+def size_key(s):
+    m = re.match(r"[\d.]+", s)
+    return float(m.group()) if m else float("inf")
 
-for ax, metric in zip(axes, metrics):
-    data = [df.loc[df["file"] == c, metric].to_numpy() for c in order]
-    ax.violinplot(data, positions=positions, showmedians=True, showextrema=True)
-    ax.set_ylabel(metric)
-    ax.grid(axis="y", alpha=0.3)
+sizes = sorted(df["size"].unique(), key=size_key)
+conditions = sorted(df["condition"].unique())
 
-axes[-1].set_xticks(list(positions))
-axes[-1].set_xticklabels(order, rotation=30, ha="right")
-fig.suptitle("Per-step timing distributions across conditions")
-fig.tight_layout()
-fig.savefig("results/violins.png", dpi=150)
-print("Wrote results/violins.png")
+# Median over steps, grouped by BOTH size and condition. Drop the per-step index
+# column, whose median is meaningless.
+median = df.drop(columns="step").groupby(["size", "condition"]).median(numeric_only=True)
+print(median)
+median.to_csv("results/median.csv", index=True)
 
-# Per-step line plot: metric vs step index, one line per condition. Use this to
-# verify the timed window is on the steady-state plateau (flat lines), not still
-# in a warmup transient (a step-down partway through).
-fig2, axes2 = plt.subplots(len(metrics), 1, figsize=(10, 11), sharex=True)
-for ax, metric in zip(axes2, metrics):
-    for c in order:
-        d = df.loc[df["file"] == c].sort_values("step")
-        ax.plot(d["step"], d[metric], marker=".", ms=4, label=c)
-    ax.set_ylabel(metric)
-    ax.grid(alpha=0.3)
-axes2[0].legend(fontsize=8, ncol=2)
-axes2[-1].set_xlabel("active step index")
-fig2.suptitle("Per-step timing vs step (check for a flat plateau)")
-fig2.tight_layout()
-fig2.savefig("results/lines.png", dpi=150)
-print("Wrote results/lines.png")
+# Within each size, normalize by that size's own baseline (its first available
+# condition in sorted order) -- sizes don't all share the same conditions.
+baseline_rows = (
+    median.reset_index()
+    .sort_values("condition")
+    .groupby("size")[list(median.columns)]
+    .first()
+)
+median_relative = median.div(baseline_rows, level="size")
+print(median_relative)
+median_relative.to_csv("results/median_relative.csv", index=True)
 
+# One violin figure and one line figure per size that we have data for.
+sns.set_theme(style="whitegrid")
 
+for size in sizes:
+    sub = df[df["size"] == size]
+    conds = [c for c in conditions if c in sub["condition"].unique()]
+
+    # Violins: per-step distribution of each metric across conditions.
+    fig, axes = plt.subplots(len(metrics), 1, figsize=(10, 11), sharex=True)
+    for ax, metric in zip(axes, metrics):
+        sns.violinplot(data=sub, x="condition", y=metric, order=conds, ax=ax)
+        ax.set_xlabel("")
+    axes[-1].set_xlabel("condition")
+    axes[-1].tick_params(axis="x", rotation=30)
+    fig.suptitle(f"Per-step timing distributions — {size}")
+    fig.tight_layout()
+    fig.savefig(f"results/violins_{size}.png", dpi=150)
+    plt.close(fig)
+
+    # Lines: metric vs step index, one line per condition (check for a flat
+    # steady-state plateau vs a warmup transient).
+    fig, axes = plt.subplots(len(metrics), 1, figsize=(10, 11), sharex=True)
+    for i, (ax, metric) in enumerate(zip(axes, metrics)):
+        sns.lineplot(
+            data=sub, x="step", y=metric, hue="condition", hue_order=conds,
+            marker=".", ax=ax, legend=(i == 0),
+        )
+    axes[-1].set_xlabel("active step index")
+    fig.suptitle(f"Per-step timing vs step — {size}")
+    fig.tight_layout()
+    fig.savefig(f"results/lines_{size}.png", dpi=150)
+    plt.close(fig)
+
+print(f"Wrote violins_<size>.png and lines_<size>.png for: {', '.join(sizes)}")
