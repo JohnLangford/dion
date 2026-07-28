@@ -8,79 +8,86 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 RESULTS = Path("results")
-metrics = ["gpu_opt_ms", "cpu_opt_ms", "dt_ms"]  # metrics to plot / summarize
-sns.set_theme(style="whitegrid")
+PLOT_METRICS = ["gpu_opt_ms", "cpu_opt_ms", "dt_ms"]  # metrics to plot
 
-# Each metrics JSON is a {"config": {...}, "steps": [...]} envelope at
-# results/<size>/<condition>/active_step_metrics_<ts>.json. Process one file at a
-# time: emit its own steps + median dataframes and violin + line plots, named by
-# size / condition / datetime. The whole config is merged onto every step row.
+
+def stacked_fig(title, fname, xlabel, draw, rotate_x=False):
+    """One column of len(PLOT_METRICS) panels; `draw(ax, metric, i)` fills each."""
+    fig, axes = plt.subplots(len(PLOT_METRICS), 1, figsize=(10, 11), sharex=True)
+    for i, (ax, m) in enumerate(zip(axes, PLOT_METRICS)):
+        draw(ax, m, i)
+        ax.set_xlabel("")
+    axes[-1].set_xlabel(xlabel)
+    if rotate_x:
+        axes[-1].tick_params(axis="x", rotation=30)
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(RESULTS / fname, dpi=150)
+    plt.close(fig)
+
+
+# Load every per-run metrics JSON ({"config": {...}, "steps": [...]}) at
+# results/<size>/<family>/<condition>/active_step_metrics_<ts>.json. The first
+# three dir levels become columns; the whole config is merged onto each row.
 frames = []
 config_keys = None
 metric_cols = None
-
 for p in sorted(RESULTS.rglob("*.json")):
     rel = p.relative_to(RESULTS)
-    if len(rel.parts) != 3:  # expect exactly size/condition/<file>.json
+    if len(rel.parts) != 4:  # expect exactly size/family/condition/<file>.json
         continue
-    size, condition = rel.parts[0], rel.parts[1]
+    size, family, condition = rel.parts[:3]
     ts = p.stem.replace("active_step_metrics_", "")
-    name = f"{size}_{condition}_{ts}"
-
-    with open(p) as f:
-        doc = json.load(f)
+    doc = json.loads(p.read_text())
     steps = pd.DataFrame(doc["steps"])
     if config_keys is None:
         config_keys = list(doc["config"])
         metric_cols = [c for c in steps.columns if c != "step"]
-
-    # Full per-step frame: every config field merged onto each row.
-    frame = steps.assign(size=size, condition=condition, datetime=ts, **doc["config"])
-    frame.to_csv(RESULTS / f"{name}_steps.tsv", sep="\t", index=False)
-    frames.append(frame)
-
-    # One-row median summary of this run's timings.
-    med = steps[metric_cols].median().to_frame().T
-    med.insert(0, "datetime", ts)
-    med.insert(0, "condition", condition)
-    med.insert(0, "size", size)
-    med.to_csv(RESULTS / f"{name}_median.tsv", sep="\t", index=False)
-
-    # Violin: this run's per-step distribution for each metric.
-    fig, axes = plt.subplots(len(metrics), 1, figsize=(5, 9))
-    for ax, m in zip(axes, metrics):
-        sns.violinplot(data=steps, y=m, ax=ax)
-    fig.suptitle(name)
-    fig.tight_layout()
-    fig.savefig(RESULTS / f"{name}_violin.png", dpi=150)
-    plt.close(fig)
-
-    # Lines: each metric vs step (check for a flat steady-state plateau).
-    fig, axes = plt.subplots(len(metrics), 1, figsize=(8, 9), sharex=True)
-    for ax, m in zip(axes, metrics):
-        sns.lineplot(data=steps, x="step", y=m, marker=".", ax=ax)
-    axes[-1].set_xlabel("active step index")
-    fig.suptitle(name)
-    fig.tight_layout()
-    fig.savefig(RESULTS / f"{name}_lines.png", dpi=150)
-    plt.close(fig)
+    frames.append(steps.assign(
+        size=size, family=family, condition=condition, datetime=ts, **doc["config"]
+    ))
 
 if not frames:
-    raise SystemExit("No metrics JSONs found under results/<size>/<condition>/")
+    raise SystemExit("No metrics JSONs found under results/<size>/<family>/<condition>/")
 
 df = pd.concat(frames, ignore_index=True)
 df.to_csv(RESULTS / "df.tsv", sep="\t", index=False)
 
-# configs: one row per file, keeping only config columns that differ somewhere,
-# so it's easy to see (per size/condition) how each file's config varies.
-per_file = df.drop_duplicates(subset=["size", "condition", "datetime"])
+# configs.tsv: one row per file, only config columns that differ somewhere.
+ids = ["size", "family", "condition", "datetime"]
+per_file = df.drop_duplicates(subset=ids)
 varying = [k for k in config_keys if per_file[k].nunique(dropna=False) > 1]
-configs = (
-    per_file[["size", "condition", "datetime"] + varying]
-    .sort_values(["size", "condition", "datetime"])
-)
-print(configs.to_string(index=False))
-configs.to_csv(RESULTS / "configs.tsv", sep="\t", index=False)
+per_file[ids + varying].sort_values(ids).to_csv(RESULTS / "configs.tsv", sep="\t", index=False)
 
-print(f"\nProcessed {len(frames)} files. Per-file *_steps.tsv/_median.tsv/_violin.png/"
-      f"_lines.png + df.tsv + configs.tsv written under results/.")
+# One violin / line / median dataframe per (size, family).
+sns.set_theme(style="whitegrid")
+grouped = df.groupby(["size", "family"], sort=False)
+for (size, family), g in grouped:
+    name = f"{size}_{family}"
+    conds = sorted(g["condition"].unique())
+
+    # One median dataframe: absolute median per condition + ratio of those
+    # medians to the baseline condition (first sorted), interleaved as <metric>
+    # and <metric>_ratio columns.
+    med = g.groupby("condition")[metric_cols].median().reindex(conds)
+    ratio = med.div(med.loc[conds[0]])
+    combined = pd.DataFrame(index=med.index)
+    for m in metric_cols:
+        combined[m] = med[m]
+        combined[f"{m}_ratio"] = ratio[m]
+    combined.to_csv(RESULTS / f"{name}_median.tsv", sep="\t", index=True)
+
+    stacked_fig(
+        f"Per-step timing distributions — {name}", f"{name}_violin.png", "condition",
+        lambda ax, m, i: sns.violinplot(data=g, x="condition", y=m, order=conds, ax=ax),
+        rotate_x=True,
+    )
+    stacked_fig(
+        f"Per-step timing vs step — {name}", f"{name}_lines.png", "active step index",
+        lambda ax, m, i: sns.lineplot(data=g, x="step", y=m, hue="condition",
+                                      hue_order=conds, marker=".", ax=ax, legend=(i == 0)),
+    )
+
+print(f"Processed {len(frames)} files into {grouped.ngroups} (size, family) group(s). "
+      f"Wrote <size>_<family>_median.tsv/_violin.png/_lines.png + df.tsv + "
+      f"configs.tsv under results/.")

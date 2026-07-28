@@ -3,7 +3,8 @@
 # all on configs/1b_baseline.yml. Model sizes are passed as CLI overrides
 # (model_dim/n_layer/n_head), which take precedence over the config -- so no
 # per-size config files are needed. Each run writes its active_step_metrics.json
-# into results/<size>/<variant>/.
+# into results/<size>/<family>/<variant>/ -- one folder per (size, family), with
+# a subfolder per condition, so different optimizer families never mix.
 #
 # Run this from an interactive session INSIDE the container (where torch is
 # available). For a batch job, use submit_variants.slurm, which enters the
@@ -89,11 +90,11 @@ for s in "${SIZES[@]}"; do
     sname="${s%%|*}"; sflags="${s#*|}"
     for v in "${VARIANTS[@]}"; do
         vname="${v%%|*}"; vflags="${v#*|}"
-        echo "=== ${sname} / ${vname}  (${sflags} ${vflags}) ==="
+        echo "=== ${sname} / ${FAMILY} / ${vname}  (${sflags} ${vflags}) ==="
         # sflags/vflags are intentionally word-split into separate CLI args.
         # shellcheck disable=SC2086
-        run "results/${sname}/${vname}" $sflags $vflags
+        run "results/${sname}/${FAMILY}/${vname}" $sflags $vflags
     done
 done
 
-echo "Done. Metrics in results/<size>/<variant>/active_step_metrics_<ts>.json"
+echo "Done. Metrics in results/<size>/<family>/<variant>/active_step_metrics_<ts>.json"
