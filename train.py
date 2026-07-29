@@ -363,10 +363,20 @@ def init_optimizer(
     # Matrix params use optimizer default settings
     param_groups = [dict(params=other_matrix_params)]
 
-    # QKV projections: full orthogonalization, no LR adjustment
-    qkv_group = dict(params=qkv_params, fraction=1.0, adjust_lr=None)
+    # QKV projections: "splitting by heads" orthogonalizes each head's submatrix independently.
+    # In this case, set fraction=1.0; since the per-head submatrices are already small, there is
+    # little to gain from filtering them further.
+    # Turn off adjust_lr under splitting: the fused QKV weights are square, so the
+    # spectral_norm factor sqrt(fan_out/fan_in) is 1, while a d x n head would get
+    # sqrt(d/n) = 1/sqrt(H). Disabling it keeps the update's entry RMS at lr/sqrt(n),
+    # matching the unsplit run. (rms_norm needs no override: 0.2*sqrt(max(fan_out,
+    # fan_in)) = 0.2*sqrt(n) either way.)
+    qkv_group = dict(params=qkv_params)
     if hp.split_heads:
         qkv_group["num_heads"] = hp.n_head
+        qkv_group["fraction"] = 1.0
+        if hp.adjust_lr == "spectral_norm":
+            qkv_group["adjust_lr"] = None
     param_groups.append(qkv_group)
 
     # Catch-all for everything that shouldn't be orthogonalized (biases, norms, embeddings)
