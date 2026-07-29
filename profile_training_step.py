@@ -33,10 +33,13 @@ Usage:
 """
 
 import argparse
+import dataclasses
+import json
 import os
 import time
 import torch
 import torch.distributed as dist
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -157,6 +160,7 @@ PROFILE_OUT = "."
 GRAD_ACCUM = 1
 COMPILE = True  # torch.compile the model (dynamic=False); --no_compile disables
 SYNC_LOG = True  # nanochat-style cuda-sync + loss readback per step; --no_sync_log disables
+NO_PROFILE = False  # skip the PyTorch profiler/trace, keep timings; --no_profile enables
 
 
 def main():
@@ -218,15 +222,23 @@ def main():
         x, y = synthetic_batch(hp)
     torch.cuda.synchronize()
 
-    prof_ctx, profiler_step_cb = _make_bench_profiler(
-        output_dir=output_dir, is_main=is_main, wait=wait, warmup=warmup, active=active
-    )
+    if NO_PROFILE:
+        # Timings only: skip the PyTorch profiler entirely (no chrome trace, no
+        # tracing overhead). The active_step_metrics collection below is driven
+        # by the wait/warmup/active counts, not the profiler, so it still works.
+        from contextlib import nullcontext
+        prof_ctx, profiler_step_cb = nullcontext(), lambda: None
+    else:
+        prof_ctx, profiler_step_cb = _make_bench_profiler(
+            output_dir=output_dir, is_main=is_main, wait=wait, warmup=warmup, active=active
+        )
 
     total_iters = wait + warmup + active
     print0(
         f"Running {total_iters} steps ({wait} wait + {warmup} warmup + "
         f"{active} active), each = {grad_accum_steps} fwd/bwd + 1 opt.step..."
     )
+    active_metrics = []
     with prof_ctx:
         t_prev = time.perf_counter()
         for it in range(total_iters):
@@ -242,6 +254,15 @@ def main():
             t_now = time.perf_counter()
             gn = m["grad_norm"]
             gn = gn.item() if hasattr(gn, "item") else float(gn)
+            if it >= wait + warmup:  # profiler's `active` window starts here
+                # Record the raw per-step timing metrics for the profiler's
+                # active window (dt added; grad_norm/loss dropped).
+                rec = {
+                    k: v for k, v in m.items() if k not in ("grad_norm", "loss")
+                }
+                rec["dt_ms"] = (t_now - t_prev) * 1000.0
+                rec["step"] = it
+                active_metrics.append(rec)
             if SYNC_LOG:
                 print0(
                     f"[step {it}/{total_iters}] loss={m['loss']:.4f} "
@@ -256,6 +277,18 @@ def main():
                     f"dt={(t_now - t_prev) * 1000:.1f}ms"
                 )
             t_prev = t_now
+
+    if is_main and active_metrics:
+        # Self-describing artifact: the exact resolved config (hp fields + all CLI
+        # flags/overrides) travels with the timings, so nothing depends on the
+        # output folder name to know what produced these numbers.
+        config = {**dataclasses.asdict(hp), **vars(cli_args), "num_params": num_params}
+        payload = {"config": config, "steps": active_metrics}
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")  # compact date+time to seconds
+        out_path = Path(output_dir) / f"active_step_metrics_{ts}.json"
+        with open(out_path, "w") as f:
+            json.dump(payload, f, indent=2)
+        print0(f"Wrote {len(active_metrics)} active-step metrics (+config) to {out_path}")
 
     if dist.is_initialized():
         dist.destroy_process_group()
@@ -289,4 +322,5 @@ if __name__ == "__main__":
     GRAD_ACCUM = _pop_flag("--grad_accum", 1, int)
     COMPILE = not _pop_bool("--no_compile")
     SYNC_LOG = not _pop_bool("--no_sync_log")
+    NO_PROFILE = _pop_bool("--no_profile")
     main()
