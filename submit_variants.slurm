@@ -12,13 +12,12 @@
 ## #SBATCH --mem=0
 ## #SBATCH --partition=gpu
 #
-# Lightweight SLURM launcher: enter the Apptainer container (conda/torch) via
-# ~/bin/singro and run the benchmark. Any args are forwarded to run_variants.sh:
-#   $1 = size ("all"/omitted for every size), $2 = optimizer family.
-#   sbatch submit_variants.slurm                     # all sizes, muon-family
-#   sbatch submit_variants.slurm 7b                  # only 7b, muon-family
-#   sbatch submit_variants.slurm 7b normuon-family   # only 7b, normuon-family
-#   sbatch submit_variants.slurm all normuon-family  # all sizes, normuon-family
+# Single-GPU launcher: enter the Apptainer container (conda/torch) via ~/bin/singro
+# and run the single-GPU sizes. Args forward to run_variants.sh (defaults to
+# all-1gpu); for the 8-GPU sizes use submit_variants_8gpu.slurm instead.
+#   sbatch submit_variants.slurm                      # all-1gpu, muon-family
+#   sbatch submit_variants.slurm 7b                   # only 7b, muon-family
+#   sbatch submit_variants.slurm all-1gpu normuon-family
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
-exec "$HOME/bin/singro" bash "$SLURM_SUBMIT_DIR/run_variants.sh" "$@"
+exec "$HOME/bin/singro" bash "$SLURM_SUBMIT_DIR/run_variants.sh" "${@:-all-1gpu}"

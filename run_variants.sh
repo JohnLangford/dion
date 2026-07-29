@@ -12,15 +12,10 @@
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 
-# Pin to a single GPU: honor CUDA_VISIBLE_DEVICES if set (e.g. by SLURM), taking
-# the first if several are exposed; otherwise default to GPU 0 (override: GPU=3).
-if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
-    export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES%%,*}"
-else
-    export CUDA_VISIBLE_DEVICES="${GPU:-0}"
-fi
-echo "Using GPU: CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
-
+# GPU visibility comes from the environment: enter via singro-bash (interactive)
+# or run via sbatch, both of which land in the SLURM job cgroup so
+# CUDA_VISIBLE_DEVICES is already scoped to exactly the GPUs you were allocated.
+# A size's "--fs_size N" then just sets how many of those GPUs a run uses.
 CONFIG="configs/1b_baseline.yml"
 
 # Model sizes (ordered). Each entry: "name|<override flags>".
@@ -29,14 +24,20 @@ SIZES=(
     "1b|--model_dim 1536 --n_layer 24 --n_head 16"
     "3b|--model_dim 2304 --n_layer 32 --n_head 18"
     "4b|--model_dim 2560 --n_layer 36 --n_head 32"
-    "7b|--model_dim 4096 --n_layer 32 --n_head 32 --device_batch_size 4 --batch_size 4"
-    "14b|--model_dim 5120 --n_layer 40 --n_head 40 --device_batch_size 4 --batch_size 4"
+    "7b|--model_dim 4096 --n_layer 32 --n_head 32"
+    # 8-GPU (FSDP) sizes: add --fs_size 8 and run() uses 8 GPUs. Needs a whole node.
+    "1b-8gpu|--model_dim 1536 --n_layer 24 --n_head 16 --fs_size 8"
+    "3b-8gpu|--model_dim 2304 --n_layer 32 --n_head 18 --fs_size 8"
+    "4b-8gpu|--model_dim 2560 --n_layer 36 --n_head 32 --fs_size 8"
+    "7b-8gpu|--model_dim 4096 --n_layer 32 --n_head 32 --fs_size 8"
+    "14b-8gpu|--model_dim 5120 --n_layer 40 --n_head 40 --fs_size 8"
 )
 
 # Args:
-#   $1 = size name, or "all" / omitted for every size (e.g. `./run_variants.sh 7b`)
+#   $1 = size selector: "all-1gpu" (default) = every single-GPU size,
+#        "all-8gpu" = every --fs_size (FSDP) size, or a specific size name.
 #   $2 = optimizer family: "muon-family" (default) or "normuon-family"
-SIZE_ARG="${1:-all}"
+SIZE_ARG="${1:-all-1gpu}"
 FAMILY="${2:-muon-family}"
 
 # The family picks the two optimizers substituted into the variants below:
@@ -64,25 +65,35 @@ VARIANTS=(
 
 run() {
     # run <out_dir> [extra flags...]
+    # nproc_per_node = N from a "--fs_size N" flag (FSDP), else 1. GPU visibility
+    # is inherited from the SLURM allocation (see header) -- not set here.
     local out="$1"; shift
     mkdir -p "$out"
-    torchrun --standalone --nproc_per_node=1 \
+    local nproc=1 prev=""
+    for a in "$@"; do
+        [[ "$prev" == "--fs_size" ]] && nproc="$a"
+        prev="$a"
+    done
+    echo "  (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}, nproc_per_node=$nproc)"
+    torchrun --standalone --nproc_per_node="$nproc" \
         profile_training_step.py --config "$CONFIG" --profile_out "$out" \
         --no_profile --profile_wait 0 --profile_warmup 50 --profile_active 25 \
         "$@"
 }
 
-if [[ "$SIZE_ARG" != "all" ]]; then
-    selected=()
-    for s in "${SIZES[@]}"; do
-        [[ "${s%%|*}" == "$SIZE_ARG" ]] && selected+=("$s")
-    done
-    if [[ ${#selected[@]} -eq 0 ]]; then
-        echo "Unknown size '$SIZE_ARG'. Valid sizes: ${SIZES[*]%%|*}" >&2
-        exit 1
-    fi
-    SIZES=("${selected[@]}")
+selected=()
+for s in "${SIZES[@]}"; do
+    case "$SIZE_ARG" in
+        all-1gpu) [[ "${s#*|}" != *--fs_size* ]] && selected+=("$s") ;;
+        all-8gpu) [[ "${s#*|}" == *--fs_size* ]] && selected+=("$s") ;;
+        *)        [[ "${s%%|*}" == "$SIZE_ARG" ]] && selected+=("$s") ;;
+    esac
+done
+if [[ ${#selected[@]} -eq 0 ]]; then
+    echo "Unknown selector '$SIZE_ARG'. Use all-1gpu, all-8gpu, or one of: ${SIZES[*]%%|*}" >&2
+    exit 1
 fi
+SIZES=("${selected[@]}")
 
 echo "Optimizer family: $FAMILY  (unfiltered=$UNFILTERED, filtered=$FILTERED)"
 
