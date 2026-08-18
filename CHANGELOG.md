@@ -62,11 +62,23 @@ All notable changes to this project are documented in this file.
   world size), so the learning rate is exact per block on every path and no longer
   depends on the normalization commuting with it. Only the norm-preserving rescale
   remains shard-local under FSDP. Muon was never affected — it has no normalization
-  step after the scales. Unsharded results are unchanged. The variance buffer `V` now
-  tracks the *unscaled* update, so its scale differs from checkpoints written by earlier
-  versions by `(adjust(block) / adjust(full))**2` per block; the update is invariant to a
-  constant rescale of `V` (it cancels between the division and the norm-preserving
-  rescale), so old checkpoints resume without a correction.
+  step after the scales. Unsharded behavior is unchanged in form; numerically it shifts
+  by one rounding, because the scale multiply moved off the bf16 Newton-Schulz output
+  onto the fp32 normalized update (~1e-4 relative on a 48x16 test case with the default
+  bf16 `polar_express`, ~1e-8 with an fp32 orthogonalizer) — the new path is the more
+  accurate one. The variance buffer `V` now tracks the *unscaled* update, so its scale
+  differs from checkpoints written by earlier versions by
+  `(adjust(block) / adjust(full))**2` per block. That difference cancels between the
+  division by `sqrt(V)` and the norm-preserving rescale only where the rescale runs
+  per block — the same condition that made the old scale placement work unsharded and
+  fail under FSDP. So an old checkpoint resumes exactly on the unsharded path (to the
+  `+1e-8` in `sqrt(V) + 1e-8`, `sqrt(V)` being of order 1e-2), while on the row-sharded
+  path the shard-local rescale cannot undo a *per-block* `V` scale and the first steps
+  after a resume reproduce the pre-fix blended learning rate — measured 0.98x / 1.17x /
+  1.00x of intended on a `(4096, 512, 512) x 4096` QKV at world size 8. `V` is not
+  versioned, so that transient is not correctable; it decays with the `V` EMA over
+  ~`1 / (1 - muon_beta2)` steps (~20 at the default 0.95) and is bounded by the behavior
+  the checkpoint was already being trained under, so no migration is required.
 
 - `CudaGraphOptimizer.load_state_dict` named its parameter `sd`, so every distributed
   checkpoint resume raised `TypeError: got an unexpected keyword argument 'state_dict'`.
