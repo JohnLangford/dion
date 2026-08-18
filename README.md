@@ -281,7 +281,7 @@ param_groups = [
 
 Each block receives the same update it would as a separate parameter: Newton-Schulz, the learning-rate adjustment (`spectral_norm` / `rms_norm`), and NorMuon's norm-preserving rescale are all computed per block. Blocks of equal size (e.g. K and V) are batched into one Newton-Schulz call. The split happens on the fully assembled matrices after the FSDP all-to-all, so the communication pattern is unchanged from the fused parameter.
 
-Requirements: the parameter must be 2D, `split_sizes` must sum to dim 0, and with FSDP dim 0 must be divisible by the world size (so the assembled matrices contain no padding rows). `split_sizes` is mutually exclusive with `num_heads`. With FSDP, NorMuon's norm-preserving rescale operates on local shards (the existing distributed behavior) rather than per block.
+Requirements: the parameter must be 2D, `split_sizes` must sum to dim 0, and with FSDP dim 0 must be divisible by the world size (so the assembled matrices contain no padding rows). `split_sizes` is mutually exclusive with `num_heads`. With FSDP, NorMuon's norm-preserving rescale operates on local shards (the existing distributed behavior) rather than per block; the per-block learning-rate adjustment is exact on every path, because NorMuon applies it after that rescale.
 
 ## Distributed Training Configuration
 

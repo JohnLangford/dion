@@ -112,6 +112,37 @@ def test_cudagraph_matches_eager(optimizer_cls):
     assert diff <= 1e-5, f"{optimizer_cls.__name__}: capture-vs-eager diff {diff:.3e}"
 
 
+def _build_split(optimizer_cls=NorMuon):
+    torch.manual_seed(SEED)
+    fused = [torch.nn.Parameter(torch.randn(48, 16, device=DEVICE))]
+    opt = optimizer_cls(
+        [{"params": fused, "split_sizes": (32, 8, 8)}],
+        distributed_mesh=None,
+        lr=0.02,
+    )
+    return fused, opt
+
+
+@pytest.mark.parametrize("optimizer_cls", [Muon, NorMuon])
+def test_cudagraph_matches_eager_with_split_sizes(optimizer_cls):
+    """A ``split_sizes`` group stays capturable. The per-block lr scales are
+    shape-derived Python floats -- for NorMuon applied as in-place narrow muls on
+    the update after normalization -- so they bake into the graph, which is
+    correct only because they never change once the shapes are fixed."""
+    p0, _ = _build_split(optimizer_cls)
+    grad_seq = _grad_seq(p0)
+
+    pe, oe = _build_split(optimizer_cls)
+    final_eager = _run(pe, oe, grad_seq, oe.step)
+
+    pg, og = _build_split(optimizer_cls)
+    wrap = CudaGraphOptimizer(og, warmup_steps=WARMUP)
+    final_graph = _run(pg, og, grad_seq, wrap.step)
+
+    diff = max((a - b).abs().max().item() for a, b in zip(final_eager, final_graph))
+    assert diff <= 1e-5, f"{optimizer_cls.__name__}: capture-vs-eager diff {diff:.3e}"
+
+
 @pytest.mark.parametrize("optimizer_cls", OPTIMIZERS)
 def test_cudagraph_tracks_scheduled_lr(optimizer_cls):
     p0, o0 = _build(optimizer_cls)
