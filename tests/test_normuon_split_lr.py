@@ -35,6 +35,11 @@ The same identity is asserted for Muon at world_size=2. Muon keeps the scales
 inside Newton-Schulz -- correct for Muon, which has nothing after them that
 could cancel them -- so the two optimizers now apply the same ``split_scales``
 at different points, and the Muon case pins the placement that is safe there.
+
+``TestVarianceRescaleInvariance`` covers the other half of the change -- ``V``
+now tracks the unscaled update, so a pre-#113 checkpoint's buffer is off by
+``split_scales**2`` per block on resume -- and pins where that cancels and where
+it does not.
 """
 
 import math
@@ -49,10 +54,11 @@ from torch.distributed.tensor import DeviceMesh, Shard, distribute_tensor
 from dion.megabatch_base import (
     adjust_lr_rms_norm,
     adjust_lr_spectral_norm,
+    compute_split_lr_scales,
     local_split_row_scales,
 )
 from dion.muon import Muon
-from dion.normuon import NorMuon
+from dion.normuon import NorMuon, normuon_normalization_stacked
 from dion.polar_express import polar_express
 
 
@@ -205,3 +211,70 @@ class TestLocalSplitRowScales:
 
     def test_no_scales(self):
         assert local_split_row_scales((32, 16), None, 0, 48) == []
+
+
+class TestVarianceRescaleInvariance:
+    """The checkpoint-resume claim in the CHANGELOG, executed.
+
+    A pre-#113 checkpoint's ``V`` is the current convention's times
+    ``split_scales**2`` per block, because ``V`` used to track the *scaled*
+    update. That difference cancels between the division by ``sqrt(V)`` and the
+    norm-preserving rescale exactly when the rescale runs per block: within a
+    block the factor is constant, so it divides out of ``z / ||z||``. Under FSDP
+    the rescale is shard-local, so a shard spanning a block boundary sees a
+    non-constant factor and cannot undo it -- the same asymmetry that made the
+    old scale placement correct unsharded and wrong sharded.
+    """
+
+    # muon_beta2 = 1 freezes the EMA, isolating the division and the rescale
+    # from the buffer update. float64 keeps the +1e-8 in the denominator, not
+    # rounding, as the only source of residual.
+    BETA2 = torch.tensor(1.0, dtype=torch.float64)
+
+    def _setup(self):
+        g = torch.Generator().manual_seed(7)
+        U = torch.randn(2, *SHAPE, generator=g, dtype=torch.float64)
+        V = torch.rand(2, SHAPE[0], 1, generator=g, dtype=torch.float64) + 0.5
+        split_scales = compute_split_lr_scales(SPLIT_SIZES, SHAPE, "spectral_norm")
+        scales = torch.cat(
+            [
+                torch.full((n, 1), s, dtype=torch.float64)
+                for n, s in zip(SPLIT_SIZES, split_scales)
+            ]
+        )
+        return U, V, scales
+
+    def _normalize(self, U, V, split_sizes):
+        out, _ = normuon_normalization_stacked(
+            U, V, self.BETA2, split_sizes=split_sizes
+        )
+        return out
+
+    def test_per_block_rescale_cancels_under_per_block_normalization(self):
+        U, V, scales = self._setup()
+        base = self._normalize(U, V, SPLIT_SIZES)
+        resumed = self._normalize(U, V * scales**2, SPLIT_SIZES)
+        torch.testing.assert_close(resumed, base, rtol=1e-6, atol=1e-8)
+
+    def test_uniform_rescale_cancels_under_whole_matrix_normalization(self):
+        U, V, _ = self._setup()
+        base = self._normalize(U, V, None)
+        resumed = self._normalize(U, V * 0.37**2, None)
+        torch.testing.assert_close(resumed, base, rtol=1e-6, atol=1e-8)
+
+    def test_per_block_rescale_does_not_cancel_under_shard_local_normalization(self):
+        # What a rank whose shard straddles a block boundary actually computes:
+        # one rescale over rows of several blocks. The stale V then leaves a
+        # per-block error, which is why the resume note is a transient and not
+        # an invariance.
+        U, V, scales = self._setup()
+        base = self._normalize(U, V, None)
+        resumed = self._normalize(U, V * scales**2, None)
+        ratios = [
+            (r.norm() / b.norm()).item()
+            for r, b in zip(
+                resumed.split(list(SPLIT_SIZES), dim=-2),
+                base.split(list(SPLIT_SIZES), dim=-2),
+            )
+        ]
+        assert max(abs(r - 1.0) for r in ratios) > 0.05, ratios

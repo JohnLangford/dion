@@ -308,15 +308,17 @@ def normuon_update_megabatch_async(
 
     # NorMuon normalization using stacked tensors for fewer kernel launches.
     # With split_sizes, the Frobenius-norm-preserving rescale runs per row
-    # block, matching separate per-block parameters. On the sharded all-to-all
-    # path U holds local shards rather than full matrices, so normalization
-    # stays per-shard there (the existing distributed approximation): a shard
-    # is a contiguous row range, so its rescale mixes blocks only where a shard
-    # straddles a block boundary. Only the norm-preserving rescale is
-    # approximated -- the learning rate itself is exact per block, applied
-    # below.
+    # block, matching separate per-block parameters. Only a row shard breaks
+    # that: U then holds a contiguous row range rather than whole matrices, so
+    # the rescale stays per-shard there (the existing distributed
+    # approximation) and mixes blocks where a shard straddles a block
+    # boundary. Keyed on comm_dim == -2 for the same reason as the row offset
+    # below -- any other comm_dim leaves dim -2 whole, so the row blocks are
+    # intact and per-block normalization is the right thing there too. Only
+    # the norm-preserving rescale is ever approximated; the learning rate
+    # itself is exact per block, applied below.
     norm_split_sizes = (
-        split_sizes if (comm_dim is None or process_group is None) else None
+        None if (comm_dim == -2 and process_group is not None) else split_sizes
     )
     V_local = to_local(V)
     V_stacked = torch.stack(V_local)
@@ -345,10 +347,16 @@ def normuon_update_megabatch_async(
         if comm_dim == -2 and process_group is not None:
             local_rows = global_comm_dim_size // world_size
             row_offset = device_rank * local_rows
-            assert U_stacked.size(-2) == local_rows, (
-                f"expected {local_rows} local rows on the sharded split path, "
-                f"got {U_stacked.size(-2)}"
-            )
+            # A raise, not an assert: -O strips asserts, and this is the one
+            # check standing between a wrong row offset and every block
+            # silently running at the wrong learning rate. It is a host-side
+            # integer compare on a path that already does per-block narrows.
+            if U_stacked.size(-2) != local_rows:
+                raise RuntimeError(
+                    f"expected {local_rows} local rows on the sharded split "
+                    f"path, got {U_stacked.size(-2)}; the row offset derived "
+                    f"from device_rank would not match this rank's shard."
+                )
         else:
             row_offset = 0
         for start, end, scale in local_split_row_scales(
