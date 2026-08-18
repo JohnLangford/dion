@@ -961,7 +961,9 @@ def compute_split_lr_scales(
     from the whole (fused) matrix shape. Each block of a split parameter
     should instead see the adjustment its own shape would receive as a
     separate parameter, so each block is rescaled by
-    ``adjust(block_shape) / adjust(full_shape)`` after Newton-Schulz.
+    ``adjust(block_shape) / adjust(full_shape)``. Muon applies the scales
+    inside Newton-Schulz (``split_scales`` here); NorMuon applies them after
+    its normalization instead, via ``local_split_row_scales`` below.
     Returns ``None`` when ``adjust_lr`` is None (no shape-dependent scaling).
     """
     if adjust_lr is None:
@@ -979,6 +981,36 @@ def compute_split_lr_scales(
         adjust_fn(1.0, (rows, num_cols), flatten=False) / full_adjust
         for rows in split_sizes
     )
+
+
+def local_split_row_scales(
+    split_sizes: Tuple[int, ...],
+    split_scales: Optional[Tuple[float, ...]],
+    row_offset: int,
+    num_rows: int,
+) -> List[Tuple[int, int, float]]:
+    """
+    Per-block learning-rate scales restricted to one rank's row shard.
+
+    ``split_scales`` is indexed by row block of the whole (fused) matrix, but a
+    caller that applies the scales after the all-to-all holds only rows
+    ``[row_offset, row_offset + num_rows)``. Returns ``(start, end, scale)``
+    triples in local row coordinates for the blocks intersecting this shard,
+    skipping unit scales. A block may straddle a shard boundary, so a shard can
+    carry a partial block, and a shard can carry rows of several blocks.
+    """
+    if split_scales is None:
+        return []
+    result = []
+    block_start = 0
+    for size, scale in zip(split_sizes, split_scales):
+        block_end = block_start + size
+        start = max(block_start, row_offset)
+        end = min(block_end, row_offset + num_rows)
+        if end > start and scale != 1.0:
+            result.append((start - row_offset, end - row_offset, scale))
+        block_start = block_end
+    return result
 
 
 def adjust_lr_rms_norm(lr, param_shape, flatten):

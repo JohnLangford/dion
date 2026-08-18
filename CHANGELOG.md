@@ -47,6 +47,27 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- NorMuon gave `split_sizes` row blocks the wrong learning rate on the FSDP2 sharded
+  path (reported in #111). The per-block correction `adjust(block) / adjust(full)` was
+  multiplied into each block right after Newton-Schulz, but NorMuon's normalization
+  then divides by `sqrt(V)` — an EMA of that same scaled update, so the factor cancels
+  — and rescales to the Frobenius norm of its input, which reintroduces the factor only
+  where that rescale is per block. Under FSDP the rescale is shard-local, so any shard
+  spanning a block boundary applied one blended factor to all its rows: with a fused
+  QKV weight `(4096, 512, 512) x 4096` and `adjust_lr="spectral_norm"`, the K and V
+  blocks ran at up to ~1.8x their intended learning rate, silently and with no warning,
+  matching the "converges faster, then diverges" report. The scales are now applied
+  after the normalization, per row block of each rank's shard (block boundaries are
+  derivable locally because `split_sizes` already requires dim 0 to be divisible by the
+  world size), so the learning rate is exact per block on every path and no longer
+  depends on the normalization commuting with it. Only the norm-preserving rescale
+  remains shard-local under FSDP. Muon was never affected — it has no normalization
+  step after the scales. Unsharded results are unchanged. The variance buffer `V` now
+  tracks the *unscaled* update, so its scale differs from checkpoints written by earlier
+  versions by `(adjust(block) / adjust(full))**2` per block; the update is invariant to a
+  constant rescale of `V` (it cancels between the division and the norm-preserving
+  rescale), so old checkpoints resume without a correction.
+
 - `CudaGraphOptimizer.load_state_dict` named its parameter `sd`, so every distributed
   checkpoint resume raised `TypeError: got an unexpected keyword argument 'state_dict'`.
   torch's DCP calls it by keyword (`_load_optim_state_dict` does

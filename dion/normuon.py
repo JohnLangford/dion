@@ -12,6 +12,7 @@ from .megabatch_base import (
     adjust_lr_spectral_norm,
     adjust_lr_rms_norm,
     compute_split_lr_scales,
+    local_split_row_scales,
 )
 from .opt_utils import AsyncTask, as_scalar_tensor, to_local
 from .muon import muon_update_pre_orthogonalize, muon_update_post_orthogonalize
@@ -53,8 +54,10 @@ class NorMuon(DistributedOrthoBase):
     separate Q, K, and V blocks, which may have unequal sizes under GQA).
     Newton-Schulz, the learning-rate adjustment, and the NorMuon norm rescale
     run per block, matching the update that separate per-block parameters
-    would receive, while the model keeps the single wide GEMM. See the README
-    for details.
+    would receive, while the model keeps the single wide GEMM. Under FSDP the
+    norm rescale is still shard-local (the existing distributed approximation),
+    but the learning-rate adjustment is exact per block. See the README for
+    details.
 
     Muon optimizer algorithm by Keller Jordan: https://kellerjordan.github.io/posts/muon/
     FSDP2 Muon uses all-to-all communications: https://www.essential.ai/blog/infra
@@ -272,12 +275,17 @@ def normuon_update_megabatch_async(
         global_comm_dim_size = None
 
     # Orthogonalize via shared megabatch communication. With split_sizes, each
-    # row block is orthogonalized independently and rescaled by split_scales,
-    # which converts the whole-matrix adjusted_lr applied below into the
-    # per-block adjustment that separate parameters would receive. The scales
-    # commute through the normalization below: a uniform per-block scale
-    # propagates self-consistently into the variance buffer and the per-block
-    # Frobenius rescale, so the normalized update is scaled by the same factor.
+    # row block is orthogonalized independently. split_scales -- which converts
+    # the whole-matrix adjusted_lr applied below into the per-block adjustment
+    # that separate parameters would receive -- is deliberately NOT applied
+    # here: the normalization below divides U by sqrt(V) and rescales it back
+    # to the Frobenius norm of its own input, so a per-block factor applied
+    # before it cancels in the division and re-enters only through that norm.
+    # That reproduces the factor only when the rescale is per block, which it
+    # is not on the sharded path, where a shard spanning a block boundary
+    # blends the two blocks' scales into one factor and silently gives both
+    # the wrong learning rate. The scales are applied after normalization
+    # instead, per row block of this rank's shard.
     # Request the stacked [N, *shape] result directly: the normalization below
     # immediately re-stacks the orthogonalized update, so taking the list and
     # re-stacking it would be an unbind-then-restack round-trip (N selects + a
@@ -294,7 +302,7 @@ def normuon_update_megabatch_async(
         epsilon=epsilon,
         global_comm_dim_size=global_comm_dim_size,
         split_sizes=split_sizes,
-        split_scales=split_scales,
+        split_scales=None,
         return_stacked=True,
     )
 
@@ -302,8 +310,11 @@ def normuon_update_megabatch_async(
     # With split_sizes, the Frobenius-norm-preserving rescale runs per row
     # block, matching separate per-block parameters. On the sharded all-to-all
     # path U holds local shards rather than full matrices, so normalization
-    # stays per-shard there (the existing distributed approximation); block
-    # boundaries are not locally available.
+    # stays per-shard there (the existing distributed approximation): a shard
+    # is a contiguous row range, so its rescale mixes blocks only where a shard
+    # straddles a block boundary. Only the norm-preserving rescale is
+    # approximated -- the learning rate itself is exact per block, applied
+    # below.
     norm_split_sizes = (
         split_sizes if (comm_dim is None or process_group is None) else None
     )
@@ -318,6 +329,30 @@ def normuon_update_megabatch_async(
     # numerically identical to the per-element loops; this is purely a
     # host-dispatch reduction (the V writeback alone was ~20% of step CPU time).
     torch._foreach_copy_(V_local, V_stacked.unbind(0))
+
+    # Apply the per-block learning-rate adjustment now that normalization can
+    # no longer cancel it. On the sharded path this rank holds rows
+    # [row_offset, row_offset + local_rows) of the fused matrix; split_sizes
+    # requires dim 0 to be divisible by the world size (megabatch_base raises
+    # otherwise), so every rank holds the same number of rows and the offset is
+    # exact. Blocks whose scale is 1.0 are skipped, so the common case costs
+    # one narrow + mul_ per block that intersects this shard, and nothing at
+    # all when adjust_lr is None.
+    if split_scales is not None:
+        if comm_dim is not None and process_group is not None:
+            local_rows = global_comm_dim_size // world_size
+            row_offset = device_rank * local_rows
+            assert U_stacked.size(-2) == local_rows, (
+                f"expected {local_rows} local rows on the sharded split path, "
+                f"got {U_stacked.size(-2)}"
+            )
+        else:
+            row_offset = 0
+        for start, end, scale in local_split_row_scales(
+            split_sizes, split_scales, row_offset, U_stacked.size(-2)
+        ):
+            U_stacked.narrow(-2, start, end - start).mul_(scale)
+
     U = list(U_stacked.unbind(0))
 
     # Compute scaled learning rate
