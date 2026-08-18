@@ -30,6 +30,11 @@ at world_size=4 two shards straddle a boundary. world_size=1 is a control -- a
 mesh dimension of size 1 is not counted as sharded (``_get_shard_info`` requires
 ``mesh.size(i) > 1``), so it exercises the unsharded per-block normalization
 path, which was already correct.
+
+The same identity is asserted for Muon at world_size=2. Muon keeps the scales
+inside Newton-Schulz -- correct for Muon, which has nothing after them that
+could cancel them -- so the two optimizers now apply the same ``split_scales``
+at different points, and the Muon case pins the placement that is safe there.
 """
 
 import math
@@ -46,6 +51,7 @@ from dion.megabatch_base import (
     adjust_lr_spectral_norm,
     local_split_row_scales,
 )
+from dion.muon import Muon
 from dion.normuon import NorMuon
 from dion.polar_express import polar_express
 
@@ -72,7 +78,10 @@ def _adjust_fn(adjust_lr):
     }[adjust_lr]
 
 
-def _worker(rank, world_size, port, adjust_lr, out_path):
+OPTIMIZERS = {"NorMuon": NorMuon, "Muon": Muon}
+
+
+def _worker(rank, world_size, port, adjust_lr, out_path, opt_name="NorMuon"):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     torch.cuda.set_device(rank)
@@ -85,7 +94,7 @@ def _worker(rank, world_size, port, adjust_lr, out_path):
     W0 = torch.randn(rows, cols, generator=g, device=dev)
     p = torch.nn.Parameter(distribute_tensor(W0, mesh, [Shard(0)]))
 
-    opt = NorMuon(
+    opt = OPTIMIZERS[opt_name](
         [dict(params=[p], split_sizes=SPLIT_SIZES)],
         distributed_mesh=mesh,
         lr=LR,
@@ -105,19 +114,24 @@ def _worker(rank, world_size, port, adjust_lr, out_path):
     dist.destroy_process_group()
 
 
-def _run(world_size, port, adjust_lr, tmp_path):
+def _run(world_size, port, adjust_lr, tmp_path, opt_name="NorMuon"):
     out = str(tmp_path / f"out_{port}.pt")
     mp.spawn(
-        _worker, args=(world_size, port, adjust_lr, out), nprocs=world_size, join=True
+        _worker,
+        args=(world_size, port, adjust_lr, out, opt_name),
+        nprocs=world_size,
+        join=True,
     )
     return torch.load(out)
 
 
-def measured_block_factors(world_size, adjust_lr, tmp_path, port_base):
+def measured_block_factors(
+    world_size, adjust_lr, tmp_path, port_base, opt_name="NorMuon"
+):
     """Per-block ||W0 - W_adjusted|| / ||W0 - W_none||, i.e. the effective
     learning rate each block actually received, in units of ``lr``."""
-    adjusted = _run(world_size, port_base, adjust_lr, tmp_path)
-    baseline = _run(world_size, port_base + 1, None, tmp_path)
+    adjusted = _run(world_size, port_base, adjust_lr, tmp_path, opt_name)
+    baseline = _run(world_size, port_base + 1, None, tmp_path, opt_name)
     d_adj = (adjusted["W0"] - adjusted["W"]).split(list(SPLIT_SIZES), dim=0)
     d_none = (baseline["W0"] - baseline["W"]).split(list(SPLIT_SIZES), dim=0)
     return [(a.norm() / b.norm()).item() for a, b in zip(d_adj, d_none)]
@@ -136,6 +150,28 @@ def test_split_blocks_get_their_own_lr_adjustment(world_size, adjust_lr, tmp_pat
         pytest.skip(f"needs >= {world_size} CUDA devices")
     port_base = 29600 + world_size * 10 + (0 if adjust_lr == "spectral_norm" else 4)
     measured = measured_block_factors(world_size, adjust_lr, tmp_path, port_base)
+    expected = expected_block_factors(adjust_lr)
+    torch.testing.assert_close(
+        torch.tensor(measured), torch.tensor(expected), rtol=2e-3, atol=1e-4
+    )
+
+
+@pytest.mark.parametrize("adjust_lr", ["spectral_norm", "rms_norm"])
+def test_muon_split_blocks_get_their_own_lr_adjustment(adjust_lr, tmp_path):
+    """Muon has no normalization after the scales, so applying them inside
+    Newton-Schulz already gave each block its own learning rate on the sharded
+    path. Asserted here, with the same ratio identity, so that a future refactor
+    cannot move Muon's scales behind a step that cancels them the way NorMuon's
+    normalization did -- the two optimizers now apply the same ``split_scales``
+    at different points, and only one of the two placements is safe for each.
+
+    world_size=2 only: the placement is what is under test, not the shard
+    geometry, which the NorMuon cases above already sweep.
+    """
+    if CUDA < 2:
+        pytest.skip("needs >= 2 CUDA devices")
+    port_base = 29680 + (0 if adjust_lr == "spectral_norm" else 4)
+    measured = measured_block_factors(2, adjust_lr, tmp_path, port_base, "Muon")
     expected = expected_block_factors(adjust_lr)
     torch.testing.assert_close(
         torch.tensor(measured), torch.tensor(expected), rtol=2e-3, atol=1e-4

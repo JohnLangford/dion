@@ -331,15 +331,18 @@ def normuon_update_megabatch_async(
     torch._foreach_copy_(V_local, V_stacked.unbind(0))
 
     # Apply the per-block learning-rate adjustment now that normalization can
-    # no longer cancel it. On the sharded path this rank holds rows
-    # [row_offset, row_offset + local_rows) of the fused matrix; split_sizes
-    # requires dim 0 to be divisible by the world size (megabatch_base raises
-    # otherwise), so every rank holds the same number of rows and the offset is
-    # exact. Blocks whose scale is 1.0 are skipped, so the common case costs
-    # one narrow + mul_ per block that intersects this shard, and nothing at
-    # all when adjust_lr is None.
+    # no longer cancel it. When the rows themselves are what is sharded, this
+    # rank holds rows [row_offset, row_offset + local_rows) of the fused matrix;
+    # split_sizes requires dim 0 to be divisible by the world size
+    # (megabatch_base raises otherwise), so every rank holds the same number of
+    # rows and the offset is exact. Any other comm_dim leaves dim -2 whole, so
+    # the offset is 0 -- the condition is on comm_dim == -2 rather than on
+    # "sharded at all" so that this does not silently depend on NorMuon
+    # rejecting last-dim shards elsewhere. Blocks whose scale is 1.0 are
+    # skipped, so the common case costs one narrow + mul_ per block that
+    # intersects this shard, and nothing at all when adjust_lr is None.
     if split_scales is not None:
-        if comm_dim is not None and process_group is not None:
+        if comm_dim == -2 and process_group is not None:
             local_rows = global_comm_dim_size // world_size
             row_offset = device_rank * local_rows
             assert U_stacked.size(-2) == local_rows, (

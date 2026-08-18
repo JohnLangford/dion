@@ -62,11 +62,15 @@ All notable changes to this project are documented in this file.
   world size), so the learning rate is exact per block on every path and no longer
   depends on the normalization commuting with it. Only the norm-preserving rescale
   remains shard-local under FSDP. Muon was never affected — it has no normalization
-  step after the scales. Unsharded results are unchanged. The variance buffer `V` now
-  tracks the *unscaled* update, so its scale differs from checkpoints written by earlier
-  versions by `(adjust(block) / adjust(full))**2` per block; the update is invariant to a
-  constant rescale of `V` (it cancels between the division and the norm-preserving
-  rescale), so old checkpoints resume without a correction.
+  step after the scales. Unsharded behavior is unchanged in form; numerically it shifts
+  by one rounding, because the scale multiply moved off the bf16 Newton-Schulz output
+  onto the fp32 normalized update (~1e-4 relative on a 48x16 test case with the default
+  bf16 `polar_express`, ~1e-8 with an fp32 orthogonalizer) — the new path is the more
+  accurate one. The variance buffer `V` now tracks the *unscaled* update, so its scale
+  differs from checkpoints written by earlier versions by
+  `(adjust(block) / adjust(full))**2` per block; the update is invariant to a constant
+  rescale of `V` up to the `+1e-8` in the normalization denominator (`sqrt(V) + 1e-8`,
+  where `sqrt(V)` is of order 1e-2), so old checkpoints resume without a correction.
 
 - `CudaGraphOptimizer.load_state_dict` named its parameter `sd`, so every distributed
   checkpoint resume raised `TypeError: got an unexpected keyword argument 'state_dict'`.
