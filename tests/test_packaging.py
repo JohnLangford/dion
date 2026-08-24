@@ -1,6 +1,6 @@
 """Tests for the packaging metadata that PyPI validates at upload time.
 
-These guard two failure modes that every local check passes:
+These guard failure modes that every local check passes:
 
 - PyPI rejects an unparseable ``author_email``, but ``twine check`` only
   renders the long description and never looks at the field. The address
@@ -11,13 +11,18 @@ These guard two failure modes that every local check passes:
   absent from the sdist, ``read_requirements`` warns and returns ``[]``, so
   building from the sdist succeeds and produces a wheel declaring *no*
   dependencies. ``MANIFEST.in`` is what keeps them in.
+- ``find_packages`` only picks up directories that have an ``__init__.py``, so
+  a new subpackage without one is dropped from the distribution silently.
 
 Metadata is read out of ``setup.py`` with ``ast`` so the tests need neither a
 build step nor torch. The artifact tests run only when ``DION_DIST_DIR`` points
-at a built ``dist/`` directory; CI sets it after ``python -m build``.
+at a built ``dist/`` directory; CI sets it after ``python -m build``. That bare
+``python -m build`` builds the wheel *from the sdist*, so the wheel assertions
+below also cover what the sdist carries.
 """
 
 import ast
+import fnmatch
 import os
 import tarfile
 import zipfile
@@ -25,10 +30,14 @@ from email.utils import parseaddr
 from pathlib import Path
 
 import pytest
+from packaging.specifiers import SpecifierSet
+from packaging.version import Version
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SETUP_PY = REPO_ROOT / "setup.py"
 MANIFEST_IN = REPO_ROOT / "MANIFEST.in"
+PACKAGE_DIR = REPO_ROOT / "dion"
+REQUIREMENTS_FILES = sorted(p.name for p in REPO_ROOT.glob("requirements_*.txt"))
 
 
 def _setup_call():
@@ -56,6 +65,15 @@ def _keyword(name):
     return ast.literal_eval(node)
 
 
+def _manifest_include_patterns():
+    patterns = []
+    for line in MANIFEST_IN.read_text().splitlines():
+        line = line.strip()
+        if line.startswith("include "):
+            patterns.extend(line.split()[1:])
+    return patterns
+
+
 def test_author_email_is_a_deliverable_address():
     """PyPI's upload API rejects an address that does not parse."""
     email = _keyword("author_email")
@@ -67,7 +85,6 @@ def test_author_email_is_a_deliverable_address():
 
 def test_version_is_pep440():
     """A tag-driven release publishes this string; PyPI requires PEP 440."""
-    Version = pytest.importorskip("packaging.version").Version
     Version(_module_assignment("version"))
 
 
@@ -87,16 +104,35 @@ def test_classifiers_declare_the_license():
     assert "License :: OSI Approved :: MIT License" in classifiers
 
 
-@pytest.mark.parametrize(
-    "requirements_file",
-    sorted(p.name for p in REPO_ROOT.glob("requirements_*.txt")),
-)
+def test_python_classifiers_agree_with_python_requires():
+    """A classifier PyPI advertises but python_requires excludes is a false claim."""
+    supported = SpecifierSet(_keyword("python_requires"))
+    declared = [
+        c.rsplit(" :: ", 1)[1]
+        for c in _keyword("classifiers")
+        if c.startswith("Programming Language :: Python :: ")
+    ]
+    versions = [v for v in declared if "." in v]
+    assert versions, "no Programming Language :: Python :: X.Y classifiers to check"
+    excluded = [v for v in versions if not supported.contains(v)]
+    assert not excluded, (
+        f"classifiers advertise Python {excluded} but python_requires "
+        f"{str(supported)!r} rejects them"
+    )
+
+
+def test_repo_has_requirements_files():
+    """The manifest and sdist tests below are parametrized on this glob."""
+    assert REQUIREMENTS_FILES, "no requirements_*.txt in the repo root; the tests below are vacuous"
+
+
+@pytest.mark.parametrize("requirements_file", REQUIREMENTS_FILES)
 def test_manifest_ships_every_requirements_file(requirements_file):
     """Any requirements file setup.py may read has to survive into the sdist."""
-    manifest = MANIFEST_IN.read_text()
-    assert f"include {requirements_file}" in manifest, (
-        f"{requirements_file} is missing from MANIFEST.in, so an sdist build would "
-        f"silently drop the dependencies it declares"
+    patterns = _manifest_include_patterns()
+    assert any(fnmatch.fnmatch(requirements_file, pattern) for pattern in patterns), (
+        f"{requirements_file} matches no include line in MANIFEST.in, so an sdist build "
+        f"would silently drop the dependencies it declares"
     )
 
 
@@ -116,7 +152,7 @@ def _one(pattern):
 def test_sdist_contains_the_requirements_files():
     with tarfile.open(_one("*.tar.gz")) as tar:
         names = {Path(n).name for n in tar.getnames()}
-    missing = [p.name for p in REPO_ROOT.glob("requirements_*.txt") if p.name not in names]
+    missing = [name for name in REQUIREMENTS_FILES if name not in names]
     assert not missing, f"sdist is missing {missing}; a build from it would declare no deps"
 
 
@@ -131,3 +167,16 @@ def test_wheel_declares_its_runtime_dependencies():
     ]
     assert any(r.startswith("torch") for r in requires), f"wheel declares no torch: {requires}"
     assert any(r.startswith("numpy") for r in requires), f"wheel declares no numpy: {requires}"
+
+
+def test_wheel_ships_every_package_module():
+    """find_packages() drops a subdirectory that has no __init__.py, without complaint."""
+    source = {p.relative_to(REPO_ROOT).as_posix() for p in PACKAGE_DIR.rglob("*.py")}
+    assert source, f"no modules found under {PACKAGE_DIR}"
+    with zipfile.ZipFile(_one("*.whl")) as wheel:
+        shipped = set(wheel.namelist())
+    missing = sorted(source - shipped)
+    assert not missing, (
+        f'the wheel is missing {missing}; find_packages(include=["dion", "dion.*"]) '
+        f"only picks up directories with an __init__.py"
+    )
