@@ -270,6 +270,75 @@ class TestNorDion2:
         torch.testing.assert_close(u_fused, u_ref, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(v_fused, v_ref, atol=1e-5, rtol=1e-5)
 
+    def test_normalize_selected_stacked_multiple_shapes(self):
+        from dion.nordion2 import nordion2_normalize_selected_stacked
+        from dion.normuon import normuon_normalization_stacked
+
+        # A second distinct shape makes dynamo generalize to dynamic shapes.
+        # PyTorch 2.13's inductor miscompiled the gather/normalize/scatter graph
+        # there, emitting a scatter epilogue that reads a temp defined only
+        # inside the reduction loop body ("NameError: tmp19 is not defined").
+        # Two of these shapes are load-bearing and must not be shrunk, or the
+        # test silently stops covering the bug:
+        #   - cols must stay large, or the reduction compiles as a persistent
+        #     (non-looped) kernel and there is no loop body to leak a temp from;
+        #   - n must stay >= 2, or dynamo specializes the batch dim on 1 and
+        #     never generalizes the graph.
+        # The dynamo config is pinned so a profile cached by an earlier process
+        # (PGO persists across runs under the inductor cache dir) cannot skip
+        # the dynamic-shape path this test exists to cover.
+        # See https://github.com/pytorch/pytorch/issues/194490
+        pinned = {"automatic_dynamic_shapes": True}
+        if hasattr(torch._dynamo.config, "automatic_dynamic_local_pgo"):
+            pinned["automatic_dynamic_local_pgo"] = False
+
+        beta2 = torch.tensor(0.9)
+        with torch._dynamo.config.patch(**pinned):
+            for n, rows, cols in [(2, 128, 4096), (2, 64, 4096), (3, 96, 2048)]:
+                k = rows // 2
+                torch.manual_seed(5)
+                u = torch.randn(n, k, cols, device=DEVICE, dtype=torch.bfloat16)
+                v_full = torch.rand(n, rows, 1, device=DEVICE, dtype=torch.bfloat16)
+                indices = torch.stack(
+                    [torch.randperm(rows, device=DEVICE)[:k] for _ in range(n)], dim=0
+                )
+
+                u_out, v_out = nordion2_normalize_selected_stacked(
+                    u.clone(), v_full.clone(), indices, beta2
+                )
+
+                idx = indices.unsqueeze(-1)
+                v_sel = torch.gather(v_full, dim=-2, index=idx).float()
+                u_ref, v_sel_new = normuon_normalization_stacked(
+                    u.clone(), v_sel, beta2
+                )
+                v_ref = v_full.clone()
+                for i in range(n):
+                    v_ref[i].scatter_(
+                        dim=-2, index=idx[i], src=v_sel_new[i].to(v_ref.dtype)
+                    )
+
+                assert u_out.shape == u.shape
+                assert v_out.shape == v_full.shape
+                torch.testing.assert_close(u_out, u_ref, atol=1e-5, rtol=1e-5)
+                torch.testing.assert_close(v_out, v_ref, atol=1e-5, rtol=1e-5)
+
+    def test_multiple_shape_groups_step(self):
+        from dion import NorDion2
+
+        # End-to-end guard for #115. The unit test above covers the helper;
+        # this covers the path a user actually hits, where the megabatch drives
+        # it once per shape group and step() raised InductorError on the second.
+        # Same load-bearing shape constraints: >= 2 params per group and a
+        # column count large enough that the reduction is not persistent.
+        params = _make_params([(256, 2048)] * 2 + [(128, 2048)] * 2)
+        opt = NorDion2(params, lr=0.01)
+        for p in params:
+            p.grad = torch.randn_like(p)
+        opt.step()
+        for p in params:
+            assert torch.isfinite(p).all()
+
 # ---------------------------------------------------------------------------
 # Dion2
 # ---------------------------------------------------------------------------
