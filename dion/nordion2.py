@@ -371,11 +371,12 @@ def nordion2_update_megabatch_async(
     )
 
     # Update variance neuron buffer for the selected rows and normalize the
-    # orthonormalized update. The gather of the selected variance rows, the
-    # NorMuon normalization (fp32 compute, V stored bf16), and the scatter of
-    # the updated rows back into the full buffer are fused into one compiled
-    # graph so the per-param Python scatter loop and the eager gather/normalize
-    # graph boundary collapse into a single launch per shape group.
+    # orthonormalized update. Stacking replaces the per-param Python loop with
+    # one launch per shape group: the gather of the selected variance rows plus
+    # the NorMuon normalization (fp32 compute, V stored bf16) are one compiled
+    # graph, and the scatter of the updated rows back into the full buffer is a
+    # second one -- deliberately not fused into the first, see
+    # nordion2_normalize_selected_stacked.
     V_local = to_local(V)
     U_stacked = torch.stack(U_ortho)
     V_stacked = torch.stack(V_local)
@@ -462,12 +463,25 @@ def nordion2_normalize_selected_stacked(
     The gather + reduction and the scatter are compiled as two graphs rather than
     one. PyTorch 2.13's inductor miscompiles the single-graph form once automatic
     dynamic shapes kick in: the scatter epilogue is emitted referencing a temp
-    defined only inside the preceding reduction loop body, so the second distinct
-    parameter shape fails to compile with ``NameError: tmp19 is not defined``.
+    defined only inside the preceding reduction loop body, and compilation dies
+    with ``NameError: tmp19 is not defined``. Reproducing it needs a shape group
+    of at least two parameters (dynamo specializes ``N == 1``, so a group holding
+    a single parameter stays on the static path) plus a second distinct
+    row/column shape to generalize on, and a reduction long enough not to be
+    compiled as a persistent kernel.
+
     Splitting the scatter into its own graph makes that fusion unreachable while
     keeping dynamic shapes (so this stays one compilation for all later shapes,
     unlike ``dynamic=False``, which recompiles per shape and hits the recompile
-    limit). See https://github.com/pytorch/pytorch/issues/194490 and #115.
+    limit). It also matters where the fused form does compile: on 2.13 its
+    generalized kernel is ~60x slower than the split one (68 ms vs 1.1 ms per
+    call at N=8, 8192x2048 on an H100), because fusing the scatter into the
+    dynamic reduction costs inductor the tiling it would otherwise pick.
+
+    This is unconditional rather than version-gated (unlike ``_inductor_workaround``
+    in dion2) so the update numerics do not depend on the torch version: the split
+    reassociates the fp32 reduction and is not bit-identical to the fused form.
+    See https://github.com/pytorch/pytorch/issues/194490 and #115.
     """
     idx = indices.unsqueeze(-1)
     U_normed, V_sel_new = _nordion2_gather_and_normalize(U, V_full, idx, muon_beta2)
