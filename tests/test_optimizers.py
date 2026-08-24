@@ -270,6 +270,46 @@ class TestNorDion2:
         torch.testing.assert_close(u_fused, u_ref, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(v_fused, v_ref, atol=1e-5, rtol=1e-5)
 
+    def test_normalize_selected_stacked_multiple_shapes(self):
+        from dion.nordion2 import nordion2_normalize_selected_stacked
+        from dion.normuon import normuon_normalization_stacked
+
+        # A second distinct shape makes dynamo generalize to dynamic shapes.
+        # PyTorch 2.13's inductor miscompiled the gather/normalize/scatter graph
+        # there, emitting a scatter epilogue that reads a temp defined only
+        # inside the reduction loop body ("NameError: tmp19 is not defined").
+        # cols must stay large: a small reduction compiles as a persistent
+        # (non-looped) kernel, which never had the bug, so shrinking these
+        # shapes would silently defuse this test.
+        # See https://github.com/pytorch/pytorch/issues/194490
+        beta2 = torch.tensor(0.9)
+        for n, rows, cols in [(2, 128, 4096), (2, 64, 4096), (3, 96, 2048)]:
+            k = rows // 2
+            torch.manual_seed(5)
+            u = torch.randn(n, k, cols, device=DEVICE, dtype=torch.bfloat16)
+            v_full = torch.rand(n, rows, 1, device=DEVICE, dtype=torch.bfloat16)
+            indices = torch.stack(
+                [torch.randperm(rows, device=DEVICE)[:k] for _ in range(n)], dim=0
+            )
+
+            u_out, v_out = nordion2_normalize_selected_stacked(
+                u.clone(), v_full.clone(), indices, beta2
+            )
+
+            idx = indices.unsqueeze(-1)
+            v_sel = torch.gather(v_full, dim=-2, index=idx).float()
+            u_ref, v_sel_new = normuon_normalization_stacked(u.clone(), v_sel, beta2)
+            v_ref = v_full.clone()
+            for i in range(n):
+                v_ref[i].scatter_(
+                    dim=-2, index=idx[i], src=v_sel_new[i].to(v_ref.dtype)
+                )
+
+            assert u_out.shape == u.shape
+            assert v_out.shape == v_full.shape
+            torch.testing.assert_close(u_out, u_ref, atol=1e-5, rtol=1e-5)
+            torch.testing.assert_close(v_out, v_ref, atol=1e-5, rtol=1e-5)
+
 # ---------------------------------------------------------------------------
 # Dion2
 # ---------------------------------------------------------------------------
